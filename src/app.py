@@ -1,4 +1,4 @@
-# app.py  — Drowsiness from eyes only (Open vs Closed). No mouth logic or UI.
+# app.py — Drowsiness from mouth only (yawn vs no_yawn). Eyes are ignored.
 import streamlit as st
 import numpy as np
 from tensorflow.keras.models import load_model
@@ -7,9 +7,9 @@ import cv2
 import time
 
 # ---------- page ----------
-st.set_page_config(page_title="Driver Drowsiness Detector 🚗", page_icon="😴", layout="centered")
-st.title("🚗 Driver Drowsiness Detection (Eyes Only)")
-st.caption("Fixed class order: ['Open','Closed','no_yawn','yawn'] — mouth classes are ignored.")
+st.set_page_config(page_title="Driver Drowsiness (Mouth Only)", page_icon="😴", layout="centered")
+st.title("😴 Driver Drowsiness Detection — Mouth Only")
+st.caption("Fixed class order: ['Open','Closed','no_yawn','yawn']. Decision uses yawn vs no_yawn only.")
 
 # ---------- model ----------
 @st.cache_resource
@@ -18,16 +18,16 @@ def load_drowsiness_model():
 
 model = load_drowsiness_model()
 
-# fixed order you asked for
+# fixed class order you asked for
 CLASSES = ['Open', 'Closed', 'no_yawn', 'yawn']
 
 # ---------- sidebar ----------
 st.sidebar.header("⚙️ Settings")
-EYE_THRESHOLD = st.sidebar.slider("Eyes closed threshold (Closed vs Open)", 0.00, 1.00, 0.60, 0.01)
-use_face_crop = st.sidebar.checkbox("Crop to face before predicting (recommended)", value=True)
+YAWN_THRESHOLD  = st.sidebar.slider("Mouth open threshold (yawn vs no_yawn)", 0.00, 1.00, 0.55, 0.01)
+use_face_crop   = st.sidebar.checkbox("Crop to face before predicting (recommended)", value=True)
 mode = st.sidebar.radio("Input mode", ["Upload Image", "Use Webcam"], index=0)
 st.sidebar.markdown("---")
-st.sidebar.caption("If it looks too sensitive, raise the threshold (e.g., 0.65–0.75).")
+st.sidebar.caption("If it’s too sensitive, raise the threshold (e.g., 0.65–0.75).")
 
 # ---------- helpers ----------
 _face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
@@ -60,31 +60,28 @@ def to_probs(vec):
     v = np.exp(v - v.max())  # softmax safety
     return v / v.sum()
 
-def predict_eye_closed_prob(pil_img):
+def predict_mouth_open_prob(pil_img):
     """
     Returns:
-      eye_closed_prob  (Closed / (Closed + Open))
-      class_probs_map  (for info only)
+      mouth_open_prob = yawn / (yawn + no_yawn)
+      two_class_map = {'no_yawn': p, 'yawn': p}
       disp_img
     """
     x, disp = preprocess(pil_img)
     raw = model.predict(x, verbose=0)[0]  # expect 4 scores
     probs = to_probs(raw)
 
-    if len(probs) < 2:
-        st.error("Model output is not 4 scores. Check models/drowsiness_model.h5")
+    if len(probs) < 4:
+        st.error("Model does not output 4 scores. Check models/drowsiness_model.h5")
         st.stop()
 
     # indices per fixed order
-    p_open   = float(probs[0])
-    p_closed = float(probs[1])
+    p_noyawn = float(probs[2])
+    p_yawn   = float(probs[3])
 
-    # relative eye prob (ignores mouth heads)
-    eye_closed_prob = p_closed / (p_closed + p_open + 1e-7)
-
-    # only for display (optional)
-    cls_map = {'Open': p_open, 'Closed': p_closed}
-    return eye_closed_prob, cls_map, disp
+    mouth_open_prob = p_yawn / (p_yawn + p_noyawn + 1e-7)
+    mouth_map = {'no_yawn': p_noyawn, 'yawn': p_yawn}
+    return mouth_open_prob, mouth_map, disp
 
 def show_prob_bars(title, mapping, order):
     st.markdown(f"**{title}**")
@@ -98,29 +95,29 @@ if mode == "Upload Image":
     file = st.file_uploader("Upload a driver's face image:", type=["jpg","jpeg","png"])
     if file:
         pil = Image.open(file).convert("RGB")
-        eye_p, eye_map, disp_img = predict_eye_closed_prob(pil)
+        mouth_p, mouth_map, disp_img = predict_mouth_open_prob(pil)
 
         st.image(disp_img, caption="Used for prediction", use_container_width=True)
 
-        eye_closed = eye_p > EYE_THRESHOLD
-        is_drowsy  = eye_closed
+        mouth_open = mouth_p > YAWN_THRESHOLD
+        is_drowsy  = mouth_open  # decision uses mouth only
 
         st.markdown("---")
-        st.subheader("🔎 Inference (Eyes Only)")
-        show_prob_bars("Open/Closed probabilities (normalized)", eye_map, ["Open","Closed"])
+        st.subheader("🔎 Inference (Mouth Only)")
+        show_prob_bars("Mouth probabilities (normalized)", mouth_map, ["no_yawn","yawn"])
 
-        st.write(f"**Eyes Closed (Closed vs Open):** {eye_p:.2f}  —  threshold: {EYE_THRESHOLD:.2f}")
-        st.progress(float(eye_p))
+        st.write(f"**Mouth Open (yawn vs no_yawn):** {mouth_p:.2f}  —  threshold: {YAWN_THRESHOLD:.2f}")
+        st.progress(float(mouth_p))
 
         st.markdown("---")
         if is_drowsy:
-            st.error("⚠️ DROWSY — Eyes considered **Closed**")
+            st.error("⚠️ DROWSY — Mouth considered **Open (Yawn)**")
         else:
-            st.success("✅ ALERT — Eyes considered **Open**")
+            st.success("✅ ALERT — Mouth considered **Closed (no_yawn)**")
 
 # ---------- webcam mode ----------
 else:
-    st.subheader("🎥 Real-time Detection via Webcam (eyes only)")
+    st.subheader("🎥 Real-time Detection via Webcam (mouth only)")
     st.info("Grant permission, then tick 'Start'. Good lighting helps.")
     start = st.checkbox("Start")
     FRAME = st.image([], caption="Webcam Feed", use_container_width=True)
@@ -138,13 +135,13 @@ else:
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         pil = Image.fromarray(rgb)
 
-        eye_p, _, _ = predict_eye_closed_prob(pil)
-        eye_closed = eye_p > EYE_THRESHOLD
-        is_drowsy  = eye_closed
+        mouth_p, _, _ = predict_mouth_open_prob(pil)
+        mouth_open = mouth_p > YAWN_THRESHOLD
+        is_drowsy  = mouth_open
 
         label = "DROWSY" if is_drowsy else "ALERT"
-        color = (255, 0, 0) if is_drowsy else (0, 200, 0)
-        text = f"{label} | EyesClosed {eye_p:.2f}"
+        color = (255,0,0) if is_drowsy else (0,200,0)
+        text = f"{label} | MouthOpen {mouth_p:.2f}"
         cv2.putText(rgb, text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
 
         FRAME.image(rgb)
