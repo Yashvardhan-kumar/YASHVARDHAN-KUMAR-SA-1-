@@ -1,176 +1,194 @@
+# app.py
 import streamlit as st
 import numpy as np
+from tensorflow.keras.models import load_model
 from PIL import Image
 import cv2
-import mediapipe as mp
+import time
 
-# ===== OPTIONAL: your keras model =====
-USE_MODEL = True
-MODEL_PATH = "models/drowsiness_model.h5"
+# ===================== PAGE CONFIG =====================
+st.set_page_config(page_title="Driver Drowsiness Detector 🚗", page_icon="😴", layout="centered")
 
-if USE_MODEL:
-    from tensorflow.keras.models import load_model
-    @st.cache_resource
-    def load_dnn():
-        return load_model(MODEL_PATH)
-    model = load_dnn()
-else:
-    model = None
+st.markdown("""
+<style>
+.main-title { font-size: 38px; font-weight: 800; text-align:center; }
+.sub-title { text-align:center; font-size: 16px; color: #666; margin-bottom: 8px; }
+.small { color:#888; font-size: 12px; }
+hr { margin: 0.5rem 0 1rem 0; }
+</style>
+""", unsafe_allow_html=True)
 
-st.set_page_config(page_title="Driver Drowsiness Detector", page_icon="😴", layout="centered")
-st.title("🚗 Driver Drowsiness, Eyes & Mouth Detection")
+st.markdown('<p class="main-title">🚗 Driver Drowsiness & Yawn Detection</p>', unsafe_allow_html=True)
+st.markdown('<p class="sub-title">Uses a 4-class model: Closed / Open / no_yawn / yawn</p>', unsafe_allow_html=True)
+st.divider()
 
-# ---------------- Sidebar thresholds ----------------
-st.sidebar.header("Thresholds / Options")
-eye_thresh   = st.sidebar.slider("Eyes closed threshold (EAR ↓)", 0.15, 0.35, 0.23, 0.01)
-mouth_thresh = st.sidebar.slider("Mouth open threshold (MAR ↑)", 0.40, 0.85, 0.60, 0.01)
-model_thresh = st.sidebar.slider("Model ‘drowsy’ threshold", 0.50, 0.99, 0.70, 0.01)
-use_webcam   = st.sidebar.checkbox("Use Webcam (else Upload Image)", value=False)
+# ===================== MODEL LOADING =====================
+@st.cache_resource
+def load_drowsiness_model():
+    # expects file at models/drowsiness_model.h5
+    return load_model("models/drowsiness_model.h5")
 
-st.sidebar.caption("Tip: EAR lower → eyes closed, MAR higher → mouth open/yawn.")
+model = load_drowsiness_model()
 
-# -------------- FaceMesh setup -----------------
-mp_face = mp.solutions.face_mesh
-face_mesh = mp_face.FaceMesh(static_image_mode=True, max_num_faces=1, refine_landmarks=True)
-LEFT_EYE  = [33, 159, 133, 145, 153, 157]  # landmarks sampling eye (approx)
-RIGHT_EYE = [362, 386, 263, 374, 380, 390]
-MOUTH     = [61, 291, 13, 14, 87, 317]     # corners + top/bottom inner lips
+# If your training used a different class order, pick it below in the sidebar.
+DEFAULT_CLASSES = ['Closed', 'Open', 'no_yawn', 'yawn']
 
-def _dist(a, b):
-    return np.linalg.norm(a-b)
+# ===================== SIDEBAR =====================
+st.sidebar.header("⚙️ Settings")
 
-def eye_aspect_ratio(land):
-    # simple EAR using vertical distances / horizontal distance (avg both eyes)
-    def ear_one(ids):
-        p = np.array([land[i] for i in ids])
-        # horiz approx: corner-to-corner (0 and 2)
-        horiz = _dist(p[0], p[2]) + 1e-6
-        # verticals: (1-5) and (3-4) pairs
-        vert = (_dist(p[1], p[5]) + _dist(p[3], p[4])) / 2.0
-        return vert / horiz
-    return (ear_one(LEFT_EYE) + ear_one(RIGHT_EYE)) / 2.0
+# Some models export logits (not normalized) or mix up the order.
+order_options = {
+    "Closed, Open, no_yawn, yawn": ['Closed', 'Open', 'no_yawn', 'yawn'],
+    "Open, Closed, no_yawn, yawn": ['Open', 'Closed', 'no_yawn', 'yawn'],
+    "Closed, Open, yawn, no_yawn": ['Closed', 'Open', 'yawn', 'no_yawn'],
+    "Open, Closed, yawn, no_yawn": ['Open', 'Closed', 'yawn', 'no_yawn'],
+}
+order_choice = st.sidebar.selectbox("Model output order", list(order_options.keys()), index=0)
+CLASSES = order_options[order_choice]
 
-def mouth_aspect_ratio(land):
-    # MAR = vertical opening / mouth width
-    # corners: 0,1; vertical: 2(top)-3(bottom) and 4-5 helpers
-    p = np.array([land[i] for i in MOUTH])
-    width = _dist(p[0], p[1]) + 1e-6
-    vertical = ( _dist(p[2], p[3]) + _dist(p[4], p[5]) ) / 2.0
-    return vertical / width
+# Thresholds (tune these if it's too sensitive)
+EYE_THRESHOLD = st.sidebar.slider("Eyes closed threshold (Closed vs Open)", 0.00, 1.00, 0.55, 0.01)
+YAWN_THRESHOLD = st.sidebar.slider("Mouth open threshold (yawn vs no_yawn)", 0.00, 1.00, 0.55, 0.01)
 
-def run_facemesh(pil):
-    img = np.array(pil.convert("RGB"))
-    h, w = img.shape[:2]
-    res = face_mesh.process(cv2.cvtColor(img, cv2.COLOR_RGB2BGR))
-    if not res.multi_face_landmarks:
-        return None, None, None
-    lm = res.multi_face_landmarks[0].landmark
-    pts = np.array([[l.x*w, l.y*h] for l in lm], dtype=np.float32)
+# Optional face crop using OpenCV Haar cascade (no extra packages)
+use_face_crop = st.sidebar.checkbox("Crop to face before predicting (recommended)", value=True)
 
-    # compute metrics
-    EAR = eye_aspect_ratio(pts)
-    MAR = mouth_aspect_ratio(pts)
+st.sidebar.markdown("---")
+mode = st.sidebar.radio("Input mode", ["Upload Image", "Use Webcam"], index=0)
 
-    # annotate flags
-    eyes_closed  = EAR < eye_thresh
-    mouth_open   = MAR > mouth_thresh
-    return EAR, MAR, (eyes_closed, mouth_open)
+# ===================== HELPERS =====================
+# OpenCV face detector (bundled with cv2)
+_face_cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
 
-def run_model(pil):
-    if model is None:
-        return None, {}
-    im = pil.resize((224, 224))
-    arr = np.array(im).astype("float32")/255.0
+def crop_face(pil_img, expand=0.20):
+    """Detect largest face and return a slightly padded crop. Falls back to original if none found."""
+    img = np.array(pil_img.convert("RGB"))
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    faces = _face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5, minSize=(60, 60))
+    if len(faces) == 0:
+        return pil_img
+
+    x, y, w, h = max(faces, key=lambda f: f[2] * f[3])  # largest
+    H, W = img.shape[:2]
+    x0 = max(0, int(x - expand * w)); y0 = max(0, int(y - expand * h))
+    x1 = min(W, int(x + w * (1 + expand))); y1 = min(H, int(y + h * (1 + expand)))
+    face = img[y0:y1, x0:x1]
+    return Image.fromarray(face)
+
+def preprocess_pil(pil_img, size=(224, 224)):
+    """Optional face crop -> resize -> scale to [0,1] -> (1,H,W,3)."""
+    if use_face_crop:
+        pil_img = crop_face(pil_img)
+    im = pil_img.resize(size).convert("RGB")
+    arr = np.array(im).astype("float32") / 255.0
     x = np.expand_dims(arr, axis=0)
-    y = model.predict(x, verbose=0)[0]
-    # normalize to probs
-    if y.ndim == 0: y = np.array([y])
-    if len(y) == 1:
-        # binary sigmoid (unknown scale) → squash then prob
-        p = float(1/(1+np.exp(-float(y[0])))) if not (0<=y[0]<=1) else float(y[0])
-        return p, {"drowsy_prob": p}
-    # softmax safety
-    y = y.astype("float64")
-    if not (0.98 <= y.sum() <= 1.02):
-        y = np.exp(y - y.max()); y = y / y.sum()
-    # assume two- or four-class; map best effort
-    names = ["Closed","Open","no_yawn","yawn"][:len(y)]
-    probs = {names[i]: float(y[i]) for i in range(len(y))}
-    p_drowsy = max(probs.get("Closed",0), probs.get("yawn",0), probs.get("drowsy",0))
-    return p_drowsy, probs
+    return x, im  # tensor + the image we show
 
-def decide(ear, mar, eyes_closed, mouth_open, p_model):
-    # final rule: if any condition is strong → Drowsy
-    votes = []
-    if eyes_closed: votes.append("eyes")
-    if mouth_open:  votes.append("mouth")
-    if p_model is not None and p_model >= model_thresh: votes.append("model")
-    return (len(votes) > 0), votes
+def to_probs(vec):
+    """Ensure we have probabilities (normalize if sums not ~1)."""
+    v = np.array(vec, dtype="float64")
+    s = v.sum()
+    if 0.98 <= s <= 1.02:
+        return v
+    # Softmax as a safe fallback
+    v = np.exp(v - v.max())
+    v = v / v.sum()
+    return v
 
-def show_metrics(ear, mar, probs):
-    st.markdown("### Metrics")
-    if ear is not None:
-        st.write(f"**EAR (eyes)**: {ear:.3f}  — *(< {eye_thresh:.2f} → closed)*")
-        st.progress(float(min(max((0.4 - ear)/0.4, 0), 1)))  # visualization only
-        st.write(f"**MAR (mouth)**: {mar:.3f} — *(> {mouth_thresh:.2f} → open)*")
-        st.progress(float(min(max(mar/1.2, 0), 1)))
-    if probs:
-        st.write("**Model probabilities:**")
-        for k,v in probs.items():
-            st.write(f"- {k}: {v:.2f}")
-            st.progress(float(v))
+def compute_relative_probs(probs, classes):
+    """Return eye_closed_prob and mouth_open_prob using relative probabilities."""
+    # Map class -> p
+    m = {cls: float(probs[i]) for i, cls in enumerate(classes)}
+    p_closed  = m.get('Closed', 0.0)
+    p_open    = m.get('Open', 0.0)
+    p_yawn    = m.get('yawn', 0.0)
+    p_noyawn  = m.get('no_yawn', 0.0)
 
-# -------- input handling --------
-def process_pil(pil):
-    ear, mar, flags = run_facemesh(pil)
-    probs = {}
-    p_model = None
-    if model is not None:
-        p_model, probs = run_model(pil)
-    if flags is None:
-        st.warning("No face detected. Try a front-facing, well-lit image.")
-        return
-    eyes_closed, mouth_open = flags
-    is_drowsy, votes = decide(ear, mar, eyes_closed, mouth_open, p_model)
-    # labels
-    st.markdown("### Status")
-    st.write(f"**Eyes:** {'Closed' if eyes_closed else 'Open'}")
-    st.write(f"**Mouth:** {'Open' if mouth_open else 'Closed'}")
-    if p_model is not None:
-        st.write(f"**Model drowsy score:** {p_model:.2f} (threshold {model_thresh:.2f})")
+    # Relative (pairwise) probabilities — stable even if all are biased
+    eye_closed_prob  = p_closed / (p_closed + p_open + 1e-7)
+    mouth_open_prob  = p_yawn   / (p_yawn   + p_noyawn + 1e-7)
 
-    show_metrics(ear, mar, probs)
-    st.markdown("---")
-    (st.error if is_drowsy else st.success)(
-        f"{'DROWSY' if is_drowsy else 'ALERT'}  •  votes: {', '.join(votes) if votes else 'none'}"
-    )
+    return eye_closed_prob, mouth_open_prob, m
 
-# ---------- UI ----------
-if not use_webcam:
-    file = st.file_uploader("Upload driver's face image", type=["jpg","jpeg","png"])
+def predict_from_pil(pil_img):
+    """Return (eye_closed_prob, mouth_open_prob, class_probs_dict, display_image)."""
+    x, disp_img = preprocess_pil(pil_img)
+    raw = model.predict(x, verbose=0)[0]  # shape (4,) typically
+    probs = to_probs(raw)
+    eye_p, mouth_p, cls_map = compute_relative_probs(probs, CLASSES)
+    return eye_p, mouth_p, cls_map, disp_img
+
+def show_prob_bars(title, mapping):
+    st.markdown(f"**{title}**")
+    for k, v in mapping.items():
+        st.write(f"- {k}: {v:.2f}")
+        st.progress(float(min(max(v, 0.0), 1.0)))
+
+# ===================== UPLOAD IMAGE MODE =====================
+if mode == "Upload Image":
+    file = st.file_uploader("Upload a driver's face image:", type=["jpg", "jpeg", "png"])
+
     if file:
         pil = Image.open(file).convert("RGB")
-        st.image(pil, caption="Input", use_container_width=True)
-        process_pil(pil)
+        eye_p, mouth_p, cls_map, disp_img = predict_from_pil(pil)
+
+        st.image(disp_img, caption="Used for prediction", use_container_width=True)
+
+        # Decision
+        eye_closed  = eye_p   > EYE_THRESHOLD
+        mouth_open  = mouth_p > YAWN_THRESHOLD
+        is_drowsy   = eye_closed or mouth_open
+
+        st.markdown("---")
+        st.subheader("🔎 Inference Details")
+
+        show_prob_bars("Raw class probabilities (normalized)", cls_map)
+
+        st.write(f"**Eyes Closed (relative Closed vs Open):** {eye_p:.2f}  —  threshold: {EYE_THRESHOLD:.2f}")
+        st.progress(float(eye_p))
+        st.write(f"**Mouth Open (relative yawn vs no_yawn):** {mouth_p:.2f}  —  threshold: {YAWN_THRESHOLD:.2f}")
+        st.progress(float(mouth_p))
+
+        st.markdown("---")
+        if is_drowsy:
+            st.error("⚠️ DROWSY — Triggered by **Eyes Closed** or **Mouth Open (Yawn)**")
+        else:
+            st.success("✅ ALERT — Eyes and mouth within safe thresholds")
+
+# ===================== WEBCAM MODE =====================
 else:
-    st.info("Webcam mode: press Start")
-    run = st.checkbox("Start")
-    FRAME = st.image([])
-    cap = cv2.VideoCapture(0)
-    while run:
+    st.subheader("🎥 Real-time Detection via Webcam")
+    st.info("Grant permission, then tick 'Start'. For best results, face the camera with good lighting.")
+    start = st.checkbox("Start")
+    FRAME = st.image([], caption="Webcam Feed", use_container_width=True)
+
+    cap = None
+    if start:
+        cap = cv2.VideoCapture(0)
+
+    while start:
         ok, frame = cap.read()
-        if not ok: break
+        if not ok:
+            st.warning("Unable to read from webcam.")
+            break
+
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
         pil = Image.fromarray(rgb)
-        ear, mar, flags = run_facemesh(pil)
-        if flags is not None:
-            eyes_closed, mouth_open = flags
-            p_model = None
-            if model is not None:
-                p_model, _ = run_model(pil)
-            is_drowsy, votes = decide(ear, mar, eyes_closed, mouth_open, p_model)
-            text = f"{'DROWSY' if is_drowsy else 'ALERT'} | EAR {ear:.2f} | MAR {mar:.2f}"
-            color = (255,0,0) if is_drowsy else (0,200,0)
-            cv2.putText(rgb, text, (20,40), cv2.FONT_HERSHEY_SIMPLEX, 1, color, 2)
+
+        eye_p, mouth_p, cls_map, _ = predict_from_pil(pil)
+        eye_closed  = eye_p   > EYE_THRESHOLD
+        mouth_open  = mouth_p > YAWN_THRESHOLD
+        is_drowsy   = eye_closed or mouth_open
+
+        label = "DROWSY" if is_drowsy else "ALERT"
+        color = (255, 0, 0) if is_drowsy else (0, 200, 0)
+
+        text = f"{label} | EyesClosed {eye_p:.2f} | MouthOpen {mouth_p:.2f}"
+        cv2.putText(rgb, text, (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, color, 2)
+
         FRAME.image(rgb)
-    cap.release()
+        # tiny sleep to avoid pegging CPU
+        time.sleep(0.03)
+
+    if cap is not None:
+        cap.release()
